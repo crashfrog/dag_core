@@ -35,6 +35,15 @@ def fix_stacktrace(func):
 			raise exc_type, exc_value, exc_traceback
 	return manipulate_stacktrace_on_exception
 	
+	
+def scan_modules(task):
+	return_set = set()
+	if hasattr(task, 'modules'):
+		return_set.update(task.modules)
+	[return_set.update(scan_modules(c)) for c in task.__children__]
+	return return_set
+	
+	
 _slugify_strip_re = re.compile(r'[^\w\s-]')
 _slugify_hyphenate_re = re.compile(r'[-\s]+')
 def _slugify(value):
@@ -120,6 +129,7 @@ class AbstractTask(object):
 		self.status = STATUS_PENDING
 		self.stdin = ""
 		self.input_files = []
+		self.command_log = []
 		
 		#These do not
 		self.__children__ = set()
@@ -149,6 +159,8 @@ class AbstractTask(object):
 				raise ValueError("file_filter must be a string glob pattern ('*.csv'), iterable of globs, or callable")
 			
 	def start(self, **kwargs):
+		"Subclasses should override start to implement features."
+		#AbstractTask should immediately complete, since it does nothing.
 		self.status = STATUS_FINISH
 		return None
 	
@@ -174,44 +186,44 @@ class AbstractTask(object):
 			raise CycleException("Graph must remain acyclic.")
 		[c.raise_if_child(potential_parent) for c in self.__children__]
 		
-	def __start__(self, *a, **kw):
-		self.stdout(self.stdin)
-		args = list(a)
-		kwargs = defaultdict(list)
-		self.params.update(kw)
-		[kwargs[k].append(v) for k, v in self.params.items()]
-		for arg in self.termargs:
-			try:
-				key, value = arg
-				kwargs[key].append(value)
-			except ValueError:
-				args.append(arg)
-		[f(*args, **kwargs) for f in self.__preprocessors__]
-		return self.start(**kwargs)
 		
-	def __bind__(self, struct):
-		#do something with termargs
-		pass
+	def __bind__(self, 
 		
-	def __finalize__(self, record, stdout, file_list, *args, **kwargs):
-		self.status = STATUS_FINISH
-		self.stdin += stdout
-		for c in self.__children__:
-			if not self.__conditionals__.get(c, lambda **r: True)(**dict(self.__dict__, **kwargs)):
-				c.status = STATUS_IGNORED
-			else:
-				c.__preload_files__(file_list)
-		[f(self, *args, **kwargs) for f in self.__postprocessors__]
-		self.termargs.extend(self.finalize(*args, **kwargs))
-		[c.termargs.extend(self.termargs) for c in self.__children__]
-		return self
 		
-	def finalize(self, *args, **kwargs):
-		termargs = []
-		for arg in args:
-			termargs.append(arg)
-		for key, value in kwargs.items():
-			termargs.append((key, value))
+# 	def __start__(self, *a, **kw):
+# 		self.stdout(self.stdin)
+# 		args = list(a)
+# 		self.params.update(kw)
+# 		kwargs = self.__bind__(self.termargs)
+# 		return self.start(**kwargs)
+# 		
+# 	def __bind__(self, termargs):
+# 		kwargs = defaultdict(list)
+# 		[kwargs[k].append(v) for k, v in self.params.items()]
+# 		for arg in self.termargs:
+# 			try:
+# 				key, value = arg
+# 				kwargs[key].append(value)
+# 			except ValueError:
+# 				args.append(arg)
+# 		[f(**kwargs) for f in self.__preprocessors__]
+# 		return kwargs
+# 		
+# 	def __finalize__(self, record, stdout, file_list, *args, **kwargs):
+# 		self.status = STATUS_FINISH
+# 		self.stdin += stdout
+# 		for c in self.__children__:
+# 			if not self.__conditionals__.get(c, lambda **r: True)(**dict(self.__dict__, **kwargs)):
+# 				c.status = STATUS_IGNORED
+# 			else:
+# 				c.__preload_files__(file_list)
+# 		[f(self, *args, **kwargs) for f in self.__postprocessors__]
+# 		#self.termargs.extend(self.finalize(*args, **kwargs))
+# 		[c.termargs.extend(self.termargs) for c in self.__children__]
+# 		return self
+		
+	def finalize(self, termargs):
+		"Subclasses should override finalize to modify what termargs get passed on to children."
 		return termargs
 		
 	def __preload_files__(self, file_list):
@@ -305,6 +317,8 @@ class AbstractTask(object):
 	def is_root(self):
 		global _root
 		_root = self
+		self.__scan_modules__ = lambda: scan_modules(self)
+		self.__getCommandLog__ = lambda: self.command_list
 		return self
 		
 	def __getJobIds__(self):
@@ -327,17 +341,28 @@ class ClusterTask(AbstractTask):
 	def __init__(self,
 				 name,
 				 run,
+				 modules=[],
 				 **kwargs):
 		super(ClusterTask, self).__init__(name, **kwargs)
 		self.run_command = run
 		self.job_id = None
+		self.modules = modules
 	
 	
 	def start(self, **kwargs):
 		params = dict()
 		params.update(self.params)
 		params.update(kwargs)
-		return set([self.run_command.format(input=i, **params).replace('\n','').replace('\t','') for i in self.input_files])
+		mods = '; '.join(['module load {}'.format(m) for m in self.modules])
+		if '{input}' in self.run_command:
+			command_set = set(['; '.join((mods, self.run_command.format(input=i, **params).replace('\n',' ').replace('\t',' '))) for i in self.input_files])
+		else:
+			command_set = set(('; '.join((mods, self.run_command.format(**params).replace('\n',' ').replace('\t',' ')))), ) #one-element set
+		_root.command_log.extend(command_set)
+		return command_set
+		
+	def __test__(self):
+		print('{} ["{}"]'.format(self.name, ' '.join(self.run_command.split()))) #self.run_command.replace('\t',' ').replace('\n',' ')))
 
 		
 class NullTask(AbstractTask):
@@ -359,5 +384,13 @@ class NullTask(AbstractTask):
 		pass
 		
 
-			
+if __name__ == '__main__':
+	#test modules behavior
+	t = ClusterTask('test task', 'command -i {input}', modules=('tm1', 'tm2', 'tm3'))
+	t.input_files = ['path/to/input.file']
+	t.is_root()
+	c = ClusterTask('test task 2', 'command', modules=(('tm4',)))
+	c.follows(t)
+	print t.start()
+	print t.scan_modules()
 		
